@@ -1,0 +1,314 @@
+---
+title: "Enhancing Marketing Strategy with Descision Tree Classification"
+author: "Team 11"
+date: "2023-07-20"
+output: pdf_document
+---
+
+```{r}
+#| warning: false
+#| message: false
+library(dplyr)
+library(car)
+library(caret)
+library(e1071)
+library(pROC)
+library(ROSE)
+library(kknn)
+library(rpart)
+library(rpart.plot)
+library(Hmisc)
+library(randomForest)
+```
+
+```{r}
+df = read.csv('XYZData.csv', sep = ',', stringsAsFactors = TRUE)
+df$adopter <- factor(df$adopter)
+df <- df[, !(names(df) == 'user_id')]
+```
+
+# Exploratory Data Analysis
+
+In this section will provide an overview of the data itself: distribution, outliers, and missing values.
+
+## Data Summary
+
+There were no missing values in the data.
+
+```{r}
+colSums(is.na(df))
+```
+
+## Data Distribution
+
+To examine their distributions, we generated bar plots for the factor data column (adoptor) and histograms for the remaining features. The adopter bar plot revealed a class imbalance between 1 and 0 among customers. We would address this problem in the subsequent section.
+
+```{r}
+non_factor_columns <- sapply(df, function(column) !is.factor(column))
+is_factor_columns <- sapply(df, function(column) is.factor(column))
+# Get the column indices as a vector
+non_factor_column_indices <- which(non_factor_columns)
+is_factor_column_indices <- which(is_factor_columns)
+
+par(mfrow = c(3, 2))
+par(oma = c(0, 0, 0, 0), mar = c(2, 2, 3, 0))
+
+for (i in is_factor_column_indices) {
+  category_percentages <- prop.table(table(df[, i])) * 100
+  barplot(category_percentages, xlab = colnames(df[i]), ylab = "Percentage")
+  title(main = "Precent Non-Adopter to Adopter\n")
+}
+```
+
+To reduce output, the following code chunk to visualize feature distributions has been muted. The code has been included for the viewer.
+
+```{r}
+# for (i in non_factor_column_indices) {
+  # h <- hist(df[, i], main = paste("Distribution for ", colnames(df[i])), xlab = "Value")
+# }
+```
+
+## Outliers
+
+Outliers were defined as values greater than Q3 + 1.5 \* IQR or less than Q1 - 1.5 \* IQR within their respective columns. More than 12 columns exhibited outliers exceeding 10% of the data, which was a substantial proportion. However, we considered not dealing with these extreme values, as they may hold insights into the adopters' behavior, and removing or manipulating them could potentially result in the loss of crucial information.
+
+```{r}
+calculate_outlier_proportion <- function(column) {
+  q1 <- quantile(column, 0.25)
+  q3 <- quantile(column, 0.75)
+  iqr <- q3 - q1
+  lower_limit <- q1 - 1.5 * iqr
+  upper_limit <- q3 + 1.5 * iqr
+  
+  outliers <- column[column < lower_limit | column > upper_limit]
+  outlier_proportion <- length(outliers) / length(column)
+  
+  return(outlier_proportion)
+}
+
+outlier_proportions <- sapply(df[,!names(df) %in% c('male','good_country','adopter')], calculate_outlier_proportion)
+
+table_data <- data.frame(Column = names(outlier_proportions), Outlier_Proportion = outlier_proportions)
+sorted_table <- table_data[order(table_data$Outlier_Proportion, decreasing = TRUE), ]
+
+print(sorted_table)
+```
+
+# Performance Metrics for Model Evaluation
+
+AUC was used as the main model performance metric. Positive Precision rate was used to explain performance to managerial stakeholders and translate model impact into business value. Below were reasons why we choose these two metrics.
+
+Due to the data imbalance, accuracy might not be a reliable performance metric, as predicting all customers as non-adopters could yield high accuracy. AUC values are cutoff-independent and provide a more comprehensive assessment of a model's ability to predict true adopters.
+
+Positive Precision was calculated as the ratio of correct adopter predictions to the total number of adopter predictions.
+
+$$
+\frac{TP}{TP + FP} \;\; \rightarrow \;\; \frac{Correct\;Adopter\;Predictions}{Correct\;Adopter\;Predictions + Incorrect \; Adopter \; Predictions}
+$$
+
+Since Website XYZ's marketing strategy targets all customers, the proportion of adopters to all customers represents the proportion of correctly identified customers, a baseline metric for improvement. This can be compared to the Precision of the end model, since it too measures a proportion of correctly identified customers. An increase from baseline to Precision would provide quantitative support for the model to be adopted into Website XYZ's marketing strategy.
+
+# Normalizing and Oversampling
+
+## Normalizing
+
+Normalization of all features data is needed to ensure that each feature contributes equally to distance calculations in the K-nearest neighbor model. This step involves scaling all relevant features for our analysis (excluding the 'user_id' column, which is not pertinent) to a standard range.
+
+```{r}
+normalize = function(x){
+  return ((x - min(x))/(max(x)-min(x)))
+}
+
+df = df[, !(names(df) == 'user_id')] 
+df_norm <- df %>%
+    mutate_at(c(1:ncol(df)-1), normalize)
+```
+
+## Splitting
+
+We split our dataset into 2 random parts using the createDataPartition() function from the *caret* package. 75% of the our data is used as training data, while the remaining 25% is reserved for testing data. This division ensures that our models are trained on a majority of the data while allowing us to evaluate their performance on unseen examples.
+
+```{r}
+set.seed(42)
+
+train_row = createDataPartition(y = df_norm$adopter, p = 0.75, list = FALSE)
+
+df_norm_train = df_norm[train_row, ]
+df_norm_test = df_norm[-train_row, ]
+```
+
+## Oversampling
+
+As previously mentioned, we observed a class imbalance between 1 and 0 among customers. Oversampling technique is used by creating additional synthetic samples for class 1 (adopter) to avoid bias towards the majority class. This procedure is only performed on our training data.
+
+```{r}
+df_norm_train_ovun <- ovun.sample(adopter~., data=df_norm_train, seed = 42, method="over")
+df_norm_train_ovun <- df_norm_train_ovun$data
+category_percentages <- prop.table(table(df_norm_train_ovun$adopter)) * 100
+table(df_norm_train_ovun$adopter)
+category_percentages
+```
+
+# K-NN
+
+## Feature Selection
+
+Random forest was applied to identify important features, reducing features from 25 to 11. It was decided that 11 features could strike a balance between reducing model complexity and retaining sufficient information for accurate predictions. Correlations among these features were also examined. Only one pair (age and avg_friend_age) exhibited a high correlation. As removing one of these features did not significantly enhance model performance, we decided to retain both in our final feature set.
+
+```{r}
+flattenCorrMatrix <- function(cormat, pmat) {
+  ut <- upper.tri(cormat)
+  data.frame(
+    row = rownames(cormat)[row(cormat)[ut]],
+    column = rownames(cormat)[col(cormat)[ut]],
+    cor  =(cormat)[ut],
+    p = pmat[ut]
+    )
+}
+res2 <- rcorr(as.matrix(df_norm_train_ovun[,1:ncol(df_norm_train_ovun)]))
+correlation <- flattenCorrMatrix(res2$r, res2$P)
+
+target <- df_norm_train_ovun$adopter
+features <- df_norm_train_ovun[, !names(df_norm_train_ovun) %in% "adopter"]
+rf_model <- randomForest(x = features, y = target, ntree = 100, mtry = 3)
+importance_scores <- importance(rf_model)
+importance_scores <- data.frame(importance_scores)
+importance_scores %>% arrange(desc(MeanDecreaseGini))
+select_features <- importance_scores %>% filter(MeanDecreaseGini >= 1000)
+select_features <- attr(select_features, "row.names")
+select_features
+```
+
+## K-NN Model
+
+By experimenting with different values of K, it was determined that K=600 yielded the best results, with an AUC of 0.7469 and a precision rate of 0.0758.
+
+```{r}
+#| warning: false
+#| message: false
+train <- df_norm_train_ovun[, c(select_features, 'adopter')]
+test <- df_norm_test[, c(select_features, 'adopter')]
+
+metrics_df <- data.frame()
+for (n in seq(from = 200, to = 600, by = 100)){
+  model_knn = kknn(adopter ~ ., train = train, test = test, k = n, distance = 5, kernel = "rectangular")
+  
+  pred_prob_knn = model_knn$prob
+  roc_curve = roc(response = test$adopter, predictor = pred_prob_knn[,'1'])
+
+  a <- auc(roc_curve)
+
+  conf_matrix <- table(test$adopter, model_knn$fitted.values)
+  true_positive <- conf_matrix[2, 2]
+  false_positive <- conf_matrix[1, 2]
+  false_negative <- conf_matrix[2, 1]
+  precision <- true_positive / (true_positive + false_positive)
+  new_row <- data.frame(Model = n, 
+                      AUC = a, 
+                      Precision = precision,
+                      stringsAsFactors = FALSE)
+  metrics_df <- rbind(metrics_df, new_row)
+
+}
+print(metrics_df)
+```
+
+# Decision Tree
+
+A decision tree model was trained with the goal of maximizing AUC by experimenting with different parameter settings while avoiding overfitting. The complexity parameter (cp) was set to a very low value to start. This substantially increased the AUC metrics of potential models, but also drastically increased our model complexity. Thus, to avoid overfitting, it became clear that the minsplit and maxdepth parameters would have to be finely tuned to sacrifice AUC for reduced complexity.
+
+It was agreed that setting a minsplit above 1000 would prevent further overfitting our model. Smaller values would enable increasingly obscure splits in the model. To experiment further a loop was created to initialized the model with maxdepths from 1 to 10. Higher maxdepth values could have been tested, but it was known that the final model would have to be found on the lower end of the maxdepth parameter to account for the low cp value.
+
+```{r}
+#| warning: false
+#| message: false
+train = df[train_row, ]
+test = df[-train_row, ]
+
+train <- ovun.sample(adopter~., data=train, seed=42, method="over")
+train <- train$data
+
+metrics_tree_df <- data.frame()
+for (n in 1:10){
+  tree = rpart(adopter ~ ., data = train,
+  method = "class", parms = list(split = "information"), control = list(minsplit = 2000, maxdepth = n, cp = 0.0001))
+  pred = predict(tree, test, type = "class")
+  pred_prob_tree = predict(tree, test, type = "prob")[, 2]
+  conf <- confusionMatrix(pred, test$adopter, mode = "prec_recall", positive = '1')
+  
+  roc_curve <- roc(test$adopter, pred_prob_tree)
+  auc_score <- auc(roc_curve)
+
+  conf_table <- conf$table
+  true_positive <- conf_table[2, 2]
+  false_positive <- conf_table[2, 1]
+  false_negative <- conf_table[1, 2]
+  accuracy <- sum(diag(conf_table)) / sum(conf_table)
+  
+  precision <- true_positive / (true_positive + false_positive)
+  recall <- true_positive / (true_positive + false_negative)
+  
+  f_score <- 2 * precision * recall / (precision + recall)
+  new_row <- data.frame(Model = n, AUC = auc_score,
+                      Precision = precision,
+                      Accuracy = accuracy,
+                      stringsAsFactors = FALSE)
+  metrics_tree_df <- rbind(metrics_tree_df, new_row)
+
+if (n > 2 & n < 7){
+  prp(tree, varlen = 0, main = paste("Maxdepth = ", n))
+}
+}
+print(metrics_tree_df)
+```
+
+The minsplit was set to 2000 to preprune trees with larger maxdepths. This was another preventative overfitting measure. The AUC of each maxdepth was then examined. While models with maxdepths of 5 and 6 splits produce the highest AUC's (0.782, 0.777), their trees were noticeably more complex than that of the model with a maxdepth of 4 (see decision tree output).
+
+It was decided that the model with a maxdepth of 4 balanced performance and complexity the best, since it had similar AUC (0.773), and a relatively simple tree diagram. While we did not choose it, the model with a maxdepth of 3 could have provided an even simpler solution, albeit with slightly lower AUC (0.754). Future attempts may consider using less stringent AUC requirements.
+
+# Model Selection and Cross Validation
+
+The decision tree model with a maxdepth of 4 was selected as a deliverable over the K-NN model with a K of 600 for two key reasons. First, the K-NN solution produced lower a slightly lower AUC value compared to the decision tree solution (0.752 \< 0.773), indicating better performance. Second, the decision tree solution automatically produced a visualization of its decision rules; the decision tree came with the added value of visual appearance.
+
+The data was randomly partitioned into 5 sets to cross validate the decision tree model. The model was run on each set of validation data and the AUC for each was recorded. The mean AUC and its standard deviation was then calculated.
+
+```{r}
+#| warning: false
+#| message: false
+cv = createFolds(y = df$adopter, k = 5)
+auc_cv = c()
+for (test_rows in cv) {
+  train = df[-test_rows,]
+  test = df[test_rows,]
+  
+  train <- ovun.sample(adopter~., data=train, seed=42, method="over")
+  train <- train$data
+  
+  tree = rpart(adopter ~ ., data = train,
+  method = "class", parms = list(split = "information"), control = list(minsplit = 2000, maxdepth = 4, cp = 0.0001))
+  pred = predict(tree, test, type = "class")
+  pred_prob_tree = predict(tree, test, type = "prob")[, 2]
+  conf <- confusionMatrix(pred, test$adopter, mode = "prec_recall", positive = '1')
+  
+  roc_curve <- roc(test$adopter, pred_prob_tree)
+  auc_score <- auc(roc_curve)
+  
+  auc_cv = c(auc_cv, auc_score)
+}
+print(paste("Mean AUC:", mean(auc_cv)))
+print(paste("Standard Deviation:", sd(auc_cv)))
+```
+
+The mean AUC was 0.765 with a standard deviation of 0.008. The mean AUC was only slightly lower than the AUC produced when originally constructing the model (0.765 \< 0.773) and the relatively small standard deviation indicated little variation. This supported the performance of the model.
+
+# Model Usage and Direction
+
+This model was created to enhance Website XYZ's marketing strategy. It can be used on future customer data to classify customers as potential adopters or non-adopters, allowing Website XYZ to narrow the scope of its marketing campaign to customers with the potential to adopt. While AUC was used here to evaluate the performance of the model, Precision was calculated to present a more intuitive metric to Website XYZ.
+
+In the context of the model's Precision, when a prediction is made for a customer there is approximately an 8% chance that they will actually be interested in subscribing. This is better than the company's original marketing strategy that marketed to all customers. Essentially, the company was correctly predicting a customer to be a potential adopter approximately 4% of the time. By comparison, one can see that this model has increased Website XYZ's likelihood of marketing to the correct person (0.08 \> 0.04).
+
+```{r}
+table(df$adopter)[2] / table(df$adopter)[1]
+```
+
+For future direction, the model could be updated with current customer data when available. This will account for new trends that may cause the training data to differ systematically from current data.
